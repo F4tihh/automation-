@@ -1,22 +1,80 @@
-const int relayPins[] = {14, 27, 26, 25, 33, 32, 18, 19};  // Röle giriş pinleri
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 
-void setup() {
-  for (int i = 0; i < 8; i++) {
-    pinMode(relayPins[i], OUTPUT);
-    digitalWrite(relayPins[i], HIGH);  // Röle başlangıçta kapalı (aktif düşük)
+/*-------------CONFIG--------------------*/
+const char*  WIFI_SSID      = "ASUS_D2";
+const char*  WIFI_Password  = "794613852";
+const String Relay_Password = "123";
+const int    Relay_PIN      = 16;
+/*-------------CONFIG--------------------*/
+
+ESP8266WebServer server(80);
+
+String State = "OFF";
+
+void setup(void) {
+  pinMode(Relay_PIN, OUTPUT);
+  digitalWrite(Relay_PIN, LOW);
+  
+  Serial.begin(115200);
+  WiFi.begin(WIFI_SSID, WIFI_Password);
+  Serial.println("");
+
+  // Wait for connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(WIFI_SSID);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin("esp8266")) {
+    Serial.println("MDNS responder started");
   }
 
-  Serial.begin(115200);
+  server.on("/", handleRoot);
+
+  server.begin();
+  Serial.println("HTTP server started");
 }
 
-void loop() {
-  // Tüm röleleri sırayla aç/kapat
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(relayPins[i], LOW);  // Röleyi aktif et (aktif düşük)
-    Serial.printf("Relay %d ON\n", i + 1);
-    delay(1000);
-    digitalWrite(relayPins[i], HIGH);  // Röleyi pasif yap
-    Serial.printf("Relay %d OFF\n", i + 1);
-    delay(500);
+void loop(void) {
+  server.handleClient();
+}
+
+void handleRoot() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+  } else {
+    Serial.println(server.arg(0));
+    Serial.println(server.arg(1));
+
+    if(server.arg(0) == Relay_Password) {
+       if(server.arg(1) == "ON") {
+           State = "ON";
+           server.send(200, "text/plain", State);
+           digitalWrite(Relay_PIN, HIGH);
+       }
+       else if(server.arg(1) == "OFF") {
+           State = "OFF";
+           server.send(200, "text/plain", State);
+           digitalWrite(Relay_PIN, LOW);
+       }
+       else if(server.arg(1) == "STATE") {
+           server.send(200, "text/plain", State);
+       }
+       else {
+           server.send(200, "text/plain", "UNKNOWN_COMMAND");
+       }
+    }
+    else {
+       server.send(401, "text/plain", "AUTH_FAIL");
+    }
   }
 }
