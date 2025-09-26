@@ -1,0 +1,380 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <MPU6050.h>
+
+// ---------------- Wi-Fi ----------------
+const char* WIFI_SSID = "VODAFONE_3P7644";
+const char* WIFI_PASS = "PTe7HbHxKbyAdxhY";
+WebServer server(80);
+
+// ---------------- Röle / Buton ----------------
+#define RELAY_PIN   2
+#define BUTTON_PIN  4
+
+// ---------------- Kumanda girişleri ----------------
+const int inputPins[] = {16, 17, 18, 19}; // 0..3
+
+// ---------------- Gyro ----------------
+MPU6050 mpu(0x68);
+int16_t ax, ay, az, gx, gy, gz;
+const float GYRO_SENS_250 = 131.0f;
+const float GYRO_THRESH_DPS = 50.0f;
+unsigned long lastGyroFireMs = 0;
+const unsigned long GYRO_COOLDOWN = 800; // ms
+float lastGyroDps = 0.0f;
+
+// ---------------- HC-SR04 ----------------
+#define TRIG_PIN 33
+#define ECHO_PIN 25
+const float THRESH_CM = 20.0f;
+unsigned long lastUltraFireMs = 0;
+const unsigned long ULTRA_COOLDOWN = 800; // ms
+float lastDistance = -1.0f;
+
+float measureDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);
+  if (!duration) return -1.0f;
+  return (duration * 0.0343f / 2.0f);
+}
+
+// ---------------- Step motor (CWD556) ----------------
+// PUL-/DIR-/ENA- -> ESP32 pinleri, PUL+/DIR+/ENA+ -> 3.3V, GND ortak
+const int pullPin   = 27;   // PUL-
+const int dirPin    = 14;   // DIR-
+const int enablePin = 13;   // ENA-
+const int stepsPerRev = 1600;
+const int PULSE_HIGH_US = 500, PULSE_LOW_US = 500;
+
+// ---------------- Debounce ----------------
+const unsigned long DEBOUNCE_MS = 50;
+bool lastInputState[4];
+unsigned long lastInputChangeMs[4];
+bool lastButtonState;
+unsigned long lastButtonChangeMs;
+
+// ---------------- Çalışma durumu / stop ----------------
+volatile bool busy = false;
+volatile bool stopRequested = false;
+
+// Web tarafı Giriş 0 toggle state
+bool webInput0Open = false;  // true=“açık durumda, kapatma bekleniyor”
+
+// ---------------- Röle darbesi ----------------
+const unsigned long PULSE_MS = 300;
+void pulseRelay() {
+  digitalWrite(RELAY_PIN, LOW);
+  delay(PULSE_MS);
+  digitalWrite(RELAY_PIN, HIGH);
+  Serial.println("Röle tetiklendi.");
+}
+
+// ---------------- Motor yardımcıları ----------------
+void stepMotor(long steps, bool ileri) {
+  // İLERİ = LOW, GERİ = HIGH (senin doğru yön ayarın)
+  digitalWrite(dirPin, ileri ? LOW : HIGH);
+  digitalWrite(enablePin, LOW);
+  delay(10);
+
+  for (long i = 0; i < steps; i++) {
+    if (stopRequested) break;
+    digitalWrite(pullPin, HIGH); delayMicroseconds(PULSE_HIGH_US);
+    digitalWrite(pullPin, LOW);  delayMicroseconds(PULSE_LOW_US);
+  }
+
+  digitalWrite(enablePin, HIGH);
+}
+
+void forwardRevs(float revs) { stepMotor((long)(revs * stepsPerRev + 0.5f), true); }
+void backRevs(float revs)    { stepMotor((long)(revs * stepsPerRev + 0.5f), false); }
+
+// ---------------- Senaryolar ----------------
+void scenario_common(unsigned long waitMs) {
+  pulseRelay();
+  Serial.println("İleri 3 tur...");
+  forwardRevs(4.5f); if (stopRequested) return; // 4.5
+  Serial.print("Bekleme (ms): "); Serial.println(waitMs);
+  unsigned long t0 = millis();
+  while (!stopRequested && millis() - t0 < waitMs) delay(5);
+  if (stopRequested) return;
+  Serial.println("Geri 3.3 tur...");
+  backRevs(4.7f); // 4.7
+}
+
+void scenario_input0_toggle_open() {
+  // Web: ilk basış -> sadece AÇ (3 ileri), bekleme YOK
+  pulseRelay();
+  Serial.println("WEB i0: İleri 3 tur (AÇ)...");
+  forwardRevs(4.5f);
+}
+
+void scenario_input0_toggle_close() {
+  // Web: ikinci basış -> sadece KAPA (3.3 geri)
+  pulseRelay();
+  Serial.println("WEB i0: Geri 3.3 tur (KAPA)...");
+  backRevs(4.7f);
+}
+
+void scenario_gyro() {
+  pulseRelay();
+  Serial.println("Gyro: Sadece ileri 3 tur...");
+  forwardRevs(4.5f);
+}
+
+// ---------------- Web arayüzü ----------------
+const char* INDEX_HTML = R"HTML(<!doctype html>
+<html lang="tr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kapı Kontrol</title>
+<style>
+:root{--bg:#0f172a;--card:#111827;--btn:#1f2937;--txt:#e5e7eb}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+.wrap{max-width:860px;margin:24px auto;padding:16px}
+.card{background:#0b1220;border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+h1{margin:0 0 8px;font-size:22px}
+p{margin:0 0 16px;color:#cbd5e1}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:12px}
+button{appearance:none;border:0;border-radius:14px;padding:16px;font-size:18px;font-weight:700;color:white;box-shadow:0 6px 16px rgba(0,0,0,.25);transition:.15s}
+button:hover{filter:brightness(1.08);transform:translateY(-1px)}button:active{transform:none}
+.i3{background:linear-gradient(135deg,#0ea5e9,#0369a1)}
+.i2{background:linear-gradient(135deg,#a78bfa,#6d28d9)}
+.i1{background:linear-gradient(135deg,#f59e0b,#b45309)}
+.i0{background:linear-gradient(135deg,#10b981,#047857)}
+.stop{background:#ef4444}
+.status{margin-top:10px;font-size:14px;color:#94a3b8}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:6px 12px;margin-top:10px}
+.kv div{padding:8px 10px;background:#0f1a2b;border-radius:10px}
+.kv b{color:#9cc3ff}
+</style></head>
+<body>
+<div class="wrap"><div class="card">
+  <h1>Kapı Kontrol</h1>
+  <p>“Giriş 3 / 2 / 1 / 0” senaryoları donanımdakiyle aynıdır. Giriş 0 webde <b>aç/kapat</b> şeklinde çalışır.</p>
+  <div class="grid">
+    <button class="i3" onclick="send('i3')">Giriş 3</button>
+    <button class="i2" onclick="send('i2')">Giriş 2</button>
+    <button class="i1" onclick="send('i1')">Giriş 1</button>
+    <button class="i0" onclick="send('i0')">Giriş 0 (Aç/Kapat)</button>
+  </div>
+  <button class="stop" style="width:100%" onclick="stopNow()">DUR</button>
+  <div class="status" id="msg">Hazır.</div>
+
+  <div class="kv">
+    <b>Durum</b><div id="s_busy">-</div>
+    <b>Mesafe</b><div id="s_dist">-</div>
+    <b>Gyro (Y dps)</b><div id="s_gyro">-</div>
+    <b>IP</b><div id="s_ip">-</div>
+  </div>
+</div></div>
+
+<script>
+async function send(cmd){
+  setMsg('Komut gönderiliyor...');
+  const r = await fetch('/api/trigger?cmd='+cmd, {method:'POST'});
+  setMsg(await r.text());
+}
+async function stopNow(){
+  const r = await fetch('/api/stop', {method:'POST'});
+  setMsg(await r.text());
+}
+function setMsg(t){ document.getElementById('msg').textContent = t; }
+
+async function poll(){
+  try{
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    document.getElementById('s_busy').textContent = s.busy ? 'Meşgul' : 'Hazır';
+    document.getElementById('s_dist').textContent = (s.distance>=0? s.distance.toFixed(1)+' cm':'-');
+    document.getElementById('s_gyro').textContent = s.gyro_dps.toFixed(1);
+    document.getElementById('s_ip').textContent = s.ip;
+  }catch(e){}
+}
+setInterval(poll, 500); poll();
+</script>
+</body></html>
+)HTML";
+
+// web komutları: i3/i2/i1 normal; i0 toggle
+void handleTrigger() {
+  if (!server.hasArg("cmd")) { server.send(400, "text/plain; charset=utf-8", "Eksik parametre"); return; }
+  if (busy) { server.send(200, "text/plain; charset=utf-8", "Meşgul: Senaryo çalışıyor"); return; }
+
+  String cmd = server.arg("cmd");
+  stopRequested = false;
+
+  busy = true;
+  if (cmd == "i3")      { server.send(200, "text/plain; charset=utf-8", "Giriş 3 çalışıyor"); scenario_common(21000); }
+  else if (cmd == "i2") { server.send(200, "text/plain; charset=utf-8", "Giriş 2 çalışıyor"); scenario_common(14000); }
+  else if (cmd == "i1") { server.send(200, "text/plain; charset=utf-8", "Giriş 1 çalışıyor"); scenario_common(7000);  }
+  else if (cmd == "i0") {
+    if (!webInput0Open) {
+      server.send(200, "text/plain; charset=utf-8", "Giriş 0: AÇ");
+      scenario_input0_toggle_open();
+      webInput0Open = true;
+    } else {
+      server.send(200, "text/plain; charset=utf-8", "Giriş 0: KAPA");
+      scenario_input0_toggle_close();
+      webInput0Open = false;
+    }
+  } else {
+    server.send(400, "text/plain; charset=utf-8", "Bilinmeyen komut");
+  }
+  busy = false;
+}
+
+void handleStop() {
+  stopRequested = true;
+  server.send(200, "text/plain; charset=utf-8", "Durdurma istendi");
+}
+
+void handleStatus() {
+  String ip = WiFi.localIP().toString();
+  String json = "{";
+  json += "\"busy\":" + String(busy ? "true" : "false") + ",";
+  json += "\"distance\":" + String(lastDistance, 2) + ",";
+  json += "\"gyro_dps\":" + String(lastGyroDps, 1) + ",";
+  json += "\"ip\":\"" + ip + "\"}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleIndex() { server.send(200, "text/html; charset=utf-8", INDEX_HTML); }
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+
+  mpu.initialize();
+  mpu.setSleepEnabled(false);
+  Serial.println(mpu.testConnection() ? "MPU6050 OK" : "MPU6050 HATA!");
+
+  pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, HIGH);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  lastButtonState = digitalRead(BUTTON_PIN);
+  lastButtonChangeMs = millis();
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(inputPins[i], INPUT);
+    lastInputState[i] = digitalRead(inputPins[i]);
+    lastInputChangeMs[i] = millis();
+  }
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT); // Echo hattında 5V->3.3V bölücü zorunlu!
+
+  pinMode(pullPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  pinMode(enablePin, OUTPUT);
+  digitalWrite(enablePin, HIGH);
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Wi-Fi: "); Serial.print(WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println(); Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  // Web
+  server.on("/", HTTP_GET, handleIndex);
+  server.on("/api/trigger", HTTP_POST, handleTrigger);
+  server.on("/api/trigger", HTTP_GET, handleTrigger); // GET de kabul
+  server.on("/api/stop", HTTP_POST, handleStop);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.begin();
+  Serial.println("HTTP sunucu hazır.");
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  // --- Kumanda kenar tetik ---
+  if (!busy) {
+    for (int i = 0; i < 4; i++) {
+      bool r = digitalRead(inputPins[i]);
+      if (r != lastInputState[i]) {
+        if (now - lastInputChangeMs[i] > DEBOUNCE_MS) {
+          bool prev = lastInputState[i];
+          lastInputState[i] = r;
+          lastInputChangeMs[i] = now;
+
+          if (prev == LOW && r == HIGH) { // rising edge
+            stopRequested = false;
+            busy = true;
+            Serial.printf("Kumanda input %d tetik!\n", i);
+            if (i == 3)        scenario_common(21000);
+            else if (i == 2)   scenario_common(14000);
+            else if (i == 1)   scenario_common(7000);
+            else if (i == 0) { // donanım input0: KAPAT/AC toggle ile uyum
+              if (webInput0Open) {              // web açık durumdaysa, kapatıp bayrağı düşür
+                scenario_input0_toggle_close();
+                webInput0Open = false;
+              } else {                          // klasik davranış: aç ve bekleme olmadan kapatmak için tekrar fiziksel bas
+                scenario_input0_toggle_open();
+                webInput0Open = true;           // web ile senkron
+              }
+            }
+            busy = false;
+          }
+        }
+      }
+    }
+  }
+
+  // --- Buton kenar tetik (input3 ile aynı) ---
+  if (!busy) {
+    bool btn = digitalRead(BUTTON_PIN);
+    if (btn != lastButtonState) {
+      if (now - lastButtonChangeMs > DEBOUNCE_MS) {
+        bool prev = lastButtonState;
+        lastButtonState = btn;
+        lastButtonChangeMs = now;
+
+        if (prev == HIGH && btn == LOW) {
+          stopRequested = false;
+          busy = true;
+          Serial.println("Buton tetik!");
+          scenario_common(21000);
+          busy = false;
+        }
+      }
+    }
+  }
+
+  // --- Gyro tetik ---
+  if (!busy) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    lastGyroDps = (float)gy / GYRO_SENS_250;
+    if (fabs(lastGyroDps) > GYRO_THRESH_DPS && (now - lastGyroFireMs) > GYRO_COOLDOWN) {
+      stopRequested = false;
+      busy = true;
+      Serial.printf("Gyro tetik |gy_dps|=%.1f\n", fabs(lastGyroDps));
+      scenario_gyro();
+      busy = false;
+      lastGyroFireMs = now;
+    }
+  }
+
+  // --- HC-SR04 ---
+  static unsigned long lastMeas = 0;
+  if (!busy && (now - lastMeas > 150)) {
+    lastMeas = now;
+    lastDistance = measureDistanceCm();
+    if (lastDistance > 0 && lastDistance < THRESH_CM && (now - lastUltraFireMs) > ULTRA_COOLDOWN) {
+      stopRequested = false;
+      busy = true;
+      Serial.printf("Ultrasonik tetik: %.1f cm\n", lastDistance);
+      scenario_common(21000);
+      busy = false;
+      lastUltraFireMs = now;
+    }
+  }
+
+  delay(5);
+}
